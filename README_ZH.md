@@ -173,6 +173,8 @@ codex-provider status --codex-home C:\Users\you\.codex
 
 把全部历史会话同步到当前 provider，或者同步到手动指定的 provider。
 
+如果 `~/.codex/config.toml` 根级没有 `model_provider`，`sync` 会默认按 `openai` 处理。
+
 ```bash
 codex-provider sync
 codex-provider sync --provider openai

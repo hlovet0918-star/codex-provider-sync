@@ -163,6 +163,8 @@ codex-provider status --codex-home C:\Users\you\.codex
 
 Sync all session metadata to the current provider or a manually specified provider.
 
+If root-level `model_provider` is missing from `~/.codex/config.toml`, `sync` treats `openai` as the default provider.
+
 ```bash
 codex-provider sync
 codex-provider sync --provider openai
