@@ -23,8 +23,28 @@ public sealed class StatusSnapshot
     public required ProviderCounts EncryptedContentCounts { get; init; }
     public string? EncryptedContentWarning { get; init; }
     public required ProviderCounts? SqliteCounts { get; init; }
+    public SqliteRepairStats? SqliteRepairStats { get; init; }
+    public IReadOnlyList<ProjectThreadVisibility> ProjectThreadVisibility { get; init; } = [];
     public required string BackupRoot { get; init; }
     public required BackupSummary BackupSummary { get; init; }
+}
+
+public sealed class SqliteRepairStats
+{
+    public required int UserEventRowsNeedingRepair { get; init; }
+    public required int CwdRowsNeedingRepair { get; init; }
+}
+
+public sealed class ProjectThreadVisibility
+{
+    public required string Root { get; init; }
+    public required int InteractiveThreads { get; init; }
+    public required int FirstPageThreads { get; init; }
+    public required int ExactCwdMatches { get; init; }
+    public required int VerbatimCwdRows { get; init; }
+    public required IReadOnlyList<int> Ranks { get; init; }
+    public required string RankPreview { get; init; }
+    public required Dictionary<string, int> ProviderCounts { get; init; }
 }
 
 public sealed class BackupSummary
@@ -61,6 +81,8 @@ public sealed class SessionChangeCollection
     public required IReadOnlyList<string> LockedPaths { get; init; }
     public required ProviderCounts ProviderCounts { get; init; }
     public required ProviderCounts EncryptedContentCounts { get; init; }
+    public required IReadOnlyCollection<string> UserEventThreadIds { get; init; }
+    public required IReadOnlyDictionary<string, string> ThreadCwdsById { get; init; }
 }
 
 public sealed class SyncResult
@@ -72,6 +94,11 @@ public sealed class SyncResult
     public required int ChangedSessionFiles { get; init; }
     public required IReadOnlyList<string> SkippedLockedRolloutFiles { get; init; }
     public required int SqliteRowsUpdated { get; init; }
+    public int SqliteProviderRowsUpdated { get; init; }
+    public int SqliteUserEventRowsUpdated { get; init; }
+    public int SqliteCwdRowsUpdated { get; init; }
+    public int UpdatedWorkspaceRoots { get; init; }
+    public int SavedWorkspaceRootCount { get; init; }
     public required bool SqlitePresent { get; init; }
     public required ProviderCounts RolloutCountsBefore { get; init; }
     public required ProviderCounts EncryptedContentCounts { get; init; }
@@ -169,4 +196,20 @@ internal sealed class SessionBackupManifestEntry
     public required string OriginalFirstLine { get; init; }
     public required string OriginalSeparator { get; init; }
     public long? OriginalLastWriteTimeUtcTicks { get; init; }
+}
+
+public sealed class WorkspaceRootSyncResult
+{
+    public required bool Present { get; init; }
+    public required bool Updated { get; init; }
+    public required int UpdatedWorkspaceRoots { get; init; }
+    public required int SavedWorkspaceRootCount { get; init; }
+}
+
+public sealed class ThreadCwdStat
+{
+    public required string Cwd { get; init; }
+    public required string NormalizedCwd { get; init; }
+    public required long Count { get; init; }
+    public required long UpdatedAtMs { get; init; }
 }

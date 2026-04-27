@@ -26,7 +26,7 @@ public static class TextFormatter
 
         if (!string.IsNullOrWhiteSpace(status.EncryptedContentWarning))
         {
-        lines.Insert(11, $"  {status.EncryptedContentWarning}");
+            lines.Insert(11, $"  {status.EncryptedContentWarning}");
         }
 
         if (status.LockedRolloutFiles.Count > 0)
@@ -46,6 +46,26 @@ public static class TextFormatter
         {
             lines.Add($"  sessions: {FormatCounts(status.SqliteCounts.Sessions)}");
             lines.Add($"  archived_sessions: {FormatCounts(status.SqliteCounts.ArchivedSessions)}");
+            if (status.SqliteRepairStats?.UserEventRowsNeedingRepair > 0)
+            {
+                lines.Add($"  user-event flags needing repair: {status.SqliteRepairStats.UserEventRowsNeedingRepair}");
+            }
+            if (status.SqliteRepairStats?.CwdRowsNeedingRepair > 0)
+            {
+                lines.Add($"  cwd paths needing repair: {status.SqliteRepairStats.CwdRowsNeedingRepair}");
+            }
+        }
+
+        if (status.ProjectThreadVisibility.Count > 0)
+        {
+            lines.Add(string.Empty);
+            lines.Add("Project visibility:");
+            foreach (ProjectThreadVisibility project in status.ProjectThreadVisibility)
+            {
+                string rankText = string.IsNullOrWhiteSpace(project.RankPreview) ? "(none)" : project.RankPreview;
+                lines.Add(
+                    $"  {project.Root}: interactive {project.InteractiveThreads}, first page {project.FirstPageThreads}/50, ranks {rankText}, exact cwd {project.ExactCwdMatches}/{project.InteractiveThreads}, verbatim cwd {project.VerbatimCwdRows}, providers {FormatCounts(project.ProviderCounts)}");
+            }
         }
 
         return string.Join(Environment.NewLine, lines);
@@ -61,6 +81,19 @@ public static class TextFormatter
             $"Updated rollout files: {result.ChangedSessionFiles}",
             $"Updated SQLite rows: {result.SqliteRowsUpdated}{(result.SqlitePresent ? string.Empty : " (state_5.sqlite not found)")}"
         ];
+
+        if (result.SqliteUserEventRowsUpdated > 0)
+        {
+            lines.Add($"Updated SQLite user-event flags: {result.SqliteUserEventRowsUpdated}");
+        }
+        if (result.SqliteCwdRowsUpdated > 0)
+        {
+            lines.Add($"Updated SQLite cwd paths: {result.SqliteCwdRowsUpdated}");
+        }
+        if (result.UpdatedWorkspaceRoots > 0)
+        {
+            lines.Add($"Updated workspace roots: {result.UpdatedWorkspaceRoots}");
+        }
 
         if (result.SkippedLockedRolloutFiles.Count > 0)
         {

@@ -14,6 +14,13 @@ function openDatabase(dbPath) {
   return new DatabaseSync(dbPath);
 }
 
+function tableHasColumn(db, tableName, columnName) {
+  return db
+    .prepare(`PRAGMA table_info(${JSON.stringify(tableName)})`)
+    .all()
+    .some((column) => column.name === columnName);
+}
+
 function normalizeBusyTimeoutMs(busyTimeoutMs) {
   return Number.isInteger(busyTimeoutMs) && busyTimeoutMs >= 0
     ? busyTimeoutMs
@@ -37,7 +44,7 @@ function isSqliteMalformedError(error) {
     || message.includes("not a database");
 }
 
-function wrapSqliteBusyError(error, action) {
+export function wrapSqliteBusyError(error, action) {
   if (!isSqliteBusyError(error)) {
     return error;
   }
@@ -46,7 +53,7 @@ function wrapSqliteBusyError(error, action) {
   );
 }
 
-function wrapSqliteMalformedError(error, action) {
+export function wrapSqliteMalformedError(error, action) {
   if (!isSqliteMalformedError(error)) {
     return error;
   }
@@ -110,6 +117,56 @@ export async function readSqliteProviderCounts(codexHome) {
   }
 }
 
+export async function readSqliteRepairStats(codexHome, options = {}) {
+  const dbPath = stateDbPath(codexHome);
+  try {
+    await fs.access(dbPath);
+  } catch {
+    return null;
+  }
+
+  let db;
+  try {
+    db = openDatabase(dbPath);
+    let userEventRowsNeedingRepair = 0;
+    if (tableHasColumn(db, "threads", "has_user_event") && options.userEventThreadIds?.size) {
+      const stmt = db.prepare("SELECT has_user_event FROM threads WHERE id = ?");
+      for (const threadId of options.userEventThreadIds) {
+        const row = stmt.get(threadId);
+        if (row && Number(row.has_user_event) !== 1) {
+          userEventRowsNeedingRepair += 1;
+        }
+      }
+    }
+
+    let cwdRowsNeedingRepair = 0;
+    if (tableHasColumn(db, "threads", "cwd") && options.threadCwdById?.size) {
+      const stmt = db.prepare("SELECT cwd FROM threads WHERE id = ?");
+      for (const [threadId, cwd] of options.threadCwdById) {
+        if (typeof threadId !== "string" || !threadId || typeof cwd !== "string" || !cwd.trim()) {
+          continue;
+        }
+        const row = stmt.get(threadId);
+        if (row && row.cwd !== cwd) {
+          cwdRowsNeedingRepair += 1;
+        }
+      }
+    }
+
+    return {
+      userEventRowsNeedingRepair,
+      cwdRowsNeedingRepair
+    };
+  } catch (error) {
+    throw wrapSqliteMalformedError(
+      wrapSqliteBusyError(error, "read SQLite repair diagnostics"),
+      "read SQLite repair diagnostics"
+    );
+  } finally {
+    db?.close();
+  }
+}
+
 export async function assertSqliteWritable(codexHome, options = {}) {
   const dbPath = stateDbPath(codexHome);
   try {
@@ -146,9 +203,21 @@ export async function updateSqliteProvider(codexHome, targetProvider, afterUpdat
     await fs.access(dbPath);
   } catch {
     if (afterUpdate) {
-      await afterUpdate({ updatedRows: 0, databasePresent: false });
+      await afterUpdate({
+        updatedRows: 0,
+        providerRowsUpdated: 0,
+        userEventRowsUpdated: 0,
+        cwdRowsUpdated: 0,
+        databasePresent: false
+      });
     }
-    return { updatedRows: 0, databasePresent: false };
+    return {
+      updatedRows: 0,
+      providerRowsUpdated: 0,
+      userEventRowsUpdated: 0,
+      cwdRowsUpdated: 0,
+      databasePresent: false
+    };
   }
 
   let db;
@@ -164,15 +233,50 @@ export async function updateSqliteProvider(codexHome, targetProvider, afterUpdat
       WHERE COALESCE(model_provider, '') <> ?
     `);
     const result = stmt.run(targetProvider, targetProvider);
+    let userEventUpdatedRows = 0;
+    if (tableHasColumn(db, "threads", "has_user_event") && options.userEventThreadIds?.size) {
+      const userEventStmt = db.prepare(`
+        UPDATE threads
+        SET has_user_event = 1
+        WHERE id = ? AND COALESCE(has_user_event, 0) <> 1
+      `);
+      for (const threadId of options.userEventThreadIds) {
+        userEventUpdatedRows += userEventStmt.run(threadId).changes ?? 0;
+      }
+    }
+    let cwdUpdatedRows = 0;
+    if (tableHasColumn(db, "threads", "cwd") && options.threadCwdById?.size) {
+      const cwdStmt = db.prepare(`
+        UPDATE threads
+        SET cwd = ?
+        WHERE id = ? AND COALESCE(cwd, '') <> ?
+      `);
+      for (const [threadId, cwd] of options.threadCwdById) {
+        if (typeof threadId !== "string" || !threadId || typeof cwd !== "string" || !cwd.trim()) {
+          continue;
+        }
+        cwdUpdatedRows += cwdStmt.run(cwd, threadId, cwd).changes ?? 0;
+      }
+    }
+    const updatedRows = (result.changes ?? 0) + userEventUpdatedRows + cwdUpdatedRows;
     if (afterUpdate) {
       await afterUpdate({
-        updatedRows: result.changes ?? 0,
+        updatedRows,
+        providerRowsUpdated: result.changes ?? 0,
+        userEventRowsUpdated: userEventUpdatedRows,
+        cwdRowsUpdated: cwdUpdatedRows,
         databasePresent: true
       });
     }
     db.exec("COMMIT");
     transactionOpen = false;
-    return { updatedRows: result.changes ?? 0, databasePresent: true };
+    return {
+      updatedRows,
+      providerRowsUpdated: result.changes ?? 0,
+      userEventRowsUpdated: userEventUpdatedRows,
+      cwdRowsUpdated: cwdUpdatedRows,
+      databasePresent: true
+    };
   } catch (error) {
     if (transactionOpen) {
       try {

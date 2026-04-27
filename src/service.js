@@ -20,6 +20,7 @@ import {
   getBackupSummary,
   pruneBackups,
   restoreBackup,
+  restoreGlobalStateFilesFromBackup,
   updateSessionBackupManifest
 } from "./backup.js";
 import { acquireLock } from "./locking.js";
@@ -33,8 +34,14 @@ import {
 import {
   assertSqliteWritable,
   readSqliteProviderCounts,
+  readSqliteRepairStats,
   updateSqliteProvider
 } from "./sqlite-state.js";
+import {
+  readProjectThreadVisibility,
+  readThreadCwdStats,
+  syncWorkspaceRoots
+} from "./workspace-roots.js";
 
 function normalizeCodexHome(explicitCodexHome) {
   return path.resolve(explicitCodexHome ?? process.env.CODEX_HOME ?? defaultCodexHome());
@@ -97,9 +104,17 @@ export async function getStatus({ codexHome: explicitCodexHome } = {}) {
   const {
     providerCounts,
     encryptedContentCounts,
-    lockedPaths
+    lockedPaths,
+    userEventThreadIds,
+    threadCwdById
   } = await collectSessionChanges(codexHome, "__status_only__", { skipLockedReads: true });
   const sqliteCounts = await readSqliteProviderCounts(codexHome);
+  const sqliteRepairStats = sqliteCounts && !sqliteCounts.unreadable
+    ? await readSqliteRepairStats(codexHome, { userEventThreadIds, threadCwdById })
+    : null;
+  const projectThreadVisibility = sqliteCounts?.unreadable
+    ? []
+    : await readProjectThreadVisibility(codexHome);
   const backupSummary = await getBackupSummary(codexHome);
 
   return {
@@ -112,6 +127,8 @@ export async function getStatus({ codexHome: explicitCodexHome } = {}) {
     encryptedContentCounts,
     encryptedContentWarning: buildEncryptedContentWarning(encryptedContentCounts, current.provider ?? DEFAULT_PROVIDER),
     sqliteCounts,
+    sqliteRepairStats,
+    projectThreadVisibility,
     backupRoot: defaultBackupRoot(codexHome),
     backupSummary
   };
@@ -150,6 +167,24 @@ export function renderStatus(status) {
   } else {
     lines.push(`  sessions: ${formatCounts(status.sqliteCounts.sessions)}`);
     lines.push(`  archived_sessions: ${formatCounts(status.sqliteCounts.archived_sessions)}`);
+    if (status.sqliteRepairStats?.userEventRowsNeedingRepair) {
+      lines.push(`  user-event flags needing repair: ${status.sqliteRepairStats.userEventRowsNeedingRepair}`);
+    }
+    if (status.sqliteRepairStats?.cwdRowsNeedingRepair) {
+      lines.push(`  cwd paths needing repair: ${status.sqliteRepairStats.cwdRowsNeedingRepair}`);
+    }
+  }
+
+  if (status.projectThreadVisibility?.length) {
+    lines.push("");
+    lines.push("Project visibility:");
+    for (const project of status.projectThreadVisibility) {
+      const providers = formatCounts(project.providerCounts);
+      const rankText = project.rankPreview || "(none)";
+      lines.push(
+        `  ${project.root}: interactive ${project.interactiveThreads}, first page ${project.firstPageThreads}/50, ranks ${rankText}, exact cwd ${project.exactCwdMatches}/${project.interactiveThreads}, verbatim cwd ${project.verbatimCwdRows}, providers ${providers}`
+      );
+    }
   }
 
   return lines.join("\n");
@@ -183,8 +218,11 @@ export async function runSync({
       changes,
       lockedPaths: lockedReadPaths,
       providerCounts,
-      encryptedContentCounts
+      encryptedContentCounts,
+      userEventThreadIds,
+      threadCwdById
     } = await collectSessionChanges(codexHome, targetProvider, { skipLockedReads: true });
+    const cwdStats = await readThreadCwdStats(codexHome);
     const encryptedContentWarning = buildEncryptedContentWarning(encryptedContentCounts, targetProvider);
     emitProgress(onProgress, {
       stage: "scan_rollout_files",
@@ -234,6 +272,12 @@ export async function runSync({
 
     let sessionRestoreNeeded = false;
     let appliedSessionChanges = [];
+    let globalStateRestoreNeeded = false;
+    let workspaceRootResult = {
+      updated: false,
+      updatedWorkspaceRoots: 0,
+      savedWorkspaceRootCount: 0
+    };
     try {
       let applyResult = { appliedChanges: 0, appliedPaths: [], skippedPaths: [] };
       emitProgress(onProgress, { stage: "update_sqlite", status: "start" });
@@ -246,16 +290,17 @@ export async function runSync({
         codexHome,
         targetProvider,
         async () => {
-          if (writableChanges.length === 0) {
-            return;
+          if (writableChanges.length > 0) {
+            applyResult = await applySessionChanges(writableChanges);
+            const appliedPathSet = new Set(applyResult.appliedPaths ?? []);
+            appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
+            sessionRestoreNeeded = appliedSessionChanges.length > 0;
+            await updateSessionBackupManifest(backupDir, appliedSessionChanges);
           }
-          applyResult = await applySessionChanges(writableChanges);
-          const appliedPathSet = new Set(applyResult.appliedPaths ?? []);
-          appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
-          sessionRestoreNeeded = appliedSessionChanges.length > 0;
-          await updateSessionBackupManifest(backupDir, appliedSessionChanges);
+          workspaceRootResult = await syncWorkspaceRoots(codexHome, { cwdStats });
+          globalStateRestoreNeeded = workspaceRootResult.updated;
         },
-        { busyTimeoutMs: sqliteBusyTimeoutMs }
+        { busyTimeoutMs: sqliteBusyTimeoutMs, userEventThreadIds, threadCwdById }
       );
       emitProgress(onProgress, {
         stage: "rewrite_rollout_files",
@@ -299,6 +344,11 @@ export async function runSync({
         changedSessionFiles: applyResult.appliedChanges,
         skippedLockedRolloutFiles,
         sqliteRowsUpdated: sqliteResult.updatedRows,
+        sqliteProviderRowsUpdated: sqliteResult.providerRowsUpdated,
+        sqliteUserEventRowsUpdated: sqliteResult.userEventRowsUpdated,
+        sqliteCwdRowsUpdated: sqliteResult.cwdRowsUpdated,
+        updatedWorkspaceRoots: workspaceRootResult.updatedWorkspaceRoots,
+        savedWorkspaceRootCount: workspaceRootResult.savedWorkspaceRootCount,
         sqlitePresent: sqliteResult.databasePresent,
         rolloutCountsBefore: summarizeProviderCounts(providerCounts),
         encryptedContentCounts,
@@ -307,6 +357,7 @@ export async function runSync({
         autoPruneWarning
       };
     } catch (error) {
+      const restoreFailures = [];
       if (sessionRestoreNeeded) {
         try {
           await restoreSessionChanges(appliedSessionChanges.map((change) => ({
@@ -315,10 +366,20 @@ export async function runSync({
             originalSeparator: change.originalSeparator
           })));
         } catch (restoreError) {
-          throw new Error(
-            `Failed to restore rollout files after sync error. Original error: ${error.message}. Restore error: ${restoreError.message}`
-          );
+          restoreFailures.push(`rollout files: ${restoreError.message}`);
         }
+      }
+      if (globalStateRestoreNeeded && backupDir) {
+        try {
+          await restoreGlobalStateFilesFromBackup(backupDir, codexHome);
+        } catch (restoreError) {
+          restoreFailures.push(`global state: ${restoreError.message}`);
+        }
+      }
+      if (restoreFailures.length > 0) {
+        throw new Error(
+          `Failed to restore state after sync error. Original error: ${error.message}. Restore error: ${restoreFailures.join("; ")}`
+        );
       }
       throw error;
     }

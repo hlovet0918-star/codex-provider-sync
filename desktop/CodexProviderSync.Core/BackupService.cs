@@ -44,6 +44,14 @@ public sealed class BackupService
         {
             await CopyIfPresentAsync(configPath, configBackupPath, overwrite: false);
         }
+        await CopyIfPresentAsync(
+            Path.Combine(codexHome, AppConstants.GlobalStateFileBasename),
+            Path.Combine(backupDir, AppConstants.GlobalStateFileBasename),
+            overwrite: false);
+        await CopyIfPresentAsync(
+            Path.Combine(codexHome, AppConstants.GlobalStateBackupFileBasename),
+            Path.Combine(backupDir, AppConstants.GlobalStateBackupFileBasename),
+            overwrite: false);
 
         DateTimeOffset createdAt = DateTimeOffset.UtcNow;
         SessionBackupManifest sessionManifest = new()
@@ -114,6 +122,14 @@ public sealed class BackupService
             await CopyIfPresentAsync(
                 Path.Combine(normalizedBackupDir, "config.toml"),
                 Path.Combine(codexHome, "config.toml"),
+                overwrite: true);
+            await CopyIfPresentAsync(
+                Path.Combine(normalizedBackupDir, AppConstants.GlobalStateFileBasename),
+                Path.Combine(codexHome, AppConstants.GlobalStateFileBasename),
+                overwrite: true);
+            await CopyIfPresentAsync(
+                Path.Combine(normalizedBackupDir, AppConstants.GlobalStateBackupFileBasename),
+                Path.Combine(codexHome, AppConstants.GlobalStateBackupFileBasename),
                 overwrite: true);
         }
 
@@ -195,6 +211,19 @@ public sealed class BackupService
 
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(sessionManifest, JsonOptions()));
         await File.WriteAllTextAsync(metadataPath, JsonSerializer.Serialize(metadata, JsonOptions()));
+    }
+
+    public async Task RestoreGlobalStateFilesAsync(string backupDir, string codexHome)
+    {
+        string normalizedBackupDir = Path.GetFullPath(backupDir);
+        await CopyIfPresentAsync(
+            Path.Combine(normalizedBackupDir, AppConstants.GlobalStateFileBasename),
+            Path.Combine(codexHome, AppConstants.GlobalStateFileBasename),
+            overwrite: true);
+        await CopyIfPresentAsync(
+            Path.Combine(normalizedBackupDir, AppConstants.GlobalStateBackupFileBasename),
+            Path.Combine(codexHome, AppConstants.GlobalStateBackupFileBasename),
+            overwrite: true);
     }
 
     public Task<BackupSummary> GetBackupSummaryAsync(string codexHome)

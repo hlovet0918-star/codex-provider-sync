@@ -87,6 +87,12 @@ async function writeConfig(codexHome, modelProviderLine = "") {
   await fs.writeFile(path.join(codexHome, "config.toml"), config, "utf8");
 }
 
+async function writeGlobalState(codexHome, value) {
+  const text = `${JSON.stringify(value, null, 2)}\n`;
+  await fs.writeFile(path.join(codexHome, ".codex-global-state.json"), text, "utf8");
+  await fs.writeFile(path.join(codexHome, ".codex-global-state.json.bak"), text, "utf8");
+}
+
 async function writeStateDb(codexHome, rows) {
   const dbPath = path.join(codexHome, "state_5.sqlite");
   const db = new DatabaseSync(dbPath);
@@ -95,13 +101,69 @@ async function writeStateDb(codexHome, rows) {
       CREATE TABLE threads (
         id TEXT PRIMARY KEY,
         model_provider TEXT,
+        cwd TEXT NOT NULL DEFAULT '',
         archived INTEGER NOT NULL DEFAULT 0,
         first_user_message TEXT NOT NULL DEFAULT ''
       )
     `);
-    const stmt = db.prepare("INSERT INTO threads (id, model_provider, archived, first_user_message) VALUES (?, ?, ?, ?)");
+    const stmt = db.prepare("INSERT INTO threads (id, model_provider, cwd, archived, first_user_message) VALUES (?, ?, ?, ?, ?)");
     for (const row of rows) {
-      stmt.run(row.id, row.model_provider, row.archived ? 1 : 0, row.first_user_message ?? "hello");
+      stmt.run(row.id, row.model_provider, row.cwd ?? "C:\\AITemp", row.archived ? 1 : 0, row.first_user_message ?? "hello");
+    }
+  } finally {
+    db.close();
+  }
+}
+
+async function writeStateDbWithUserEventColumn(codexHome, rows) {
+  const dbPath = path.join(codexHome, "state_5.sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        model_provider TEXT,
+        cwd TEXT NOT NULL DEFAULT '',
+        archived INTEGER NOT NULL DEFAULT 0,
+        has_user_event INTEGER NOT NULL DEFAULT 0,
+        first_user_message TEXT NOT NULL DEFAULT ''
+      )
+    `);
+    const stmt = db.prepare("INSERT INTO threads (id, model_provider, cwd, archived, has_user_event, first_user_message) VALUES (?, ?, ?, ?, ?, ?)");
+    for (const row of rows) {
+      stmt.run(row.id, row.model_provider, row.cwd ?? "C:\\AITemp", row.archived ? 1 : 0, row.has_user_event ? 1 : 0, row.first_user_message ?? "hello");
+    }
+  } finally {
+    db.close();
+  }
+}
+
+async function writeStateDbForProjectVisibility(codexHome, rows) {
+  const dbPath = path.join(codexHome, "state_5.sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        model_provider TEXT,
+        cwd TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'cli',
+        archived INTEGER NOT NULL DEFAULT 0,
+        first_user_message TEXT NOT NULL DEFAULT '',
+        updated_at_ms INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    const stmt = db.prepare("INSERT INTO threads (id, model_provider, cwd, source, archived, first_user_message, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)");
+    for (const row of rows) {
+      stmt.run(
+        row.id,
+        row.model_provider ?? "dal",
+        row.cwd,
+        row.source ?? "cli",
+        row.archived ? 1 : 0,
+        row.first_user_message ?? "hello",
+        row.updated_at_ms ?? 0
+      );
     }
   } finally {
     db.close();
@@ -274,6 +336,168 @@ test("runSync reports stage progress and backup duration", async () => {
   assert.ok(backupCompleteEvent.durationMs >= 0);
 });
 
+test("runSync repairs SQLite has_user_event from rollout user messages", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-a.jsonl");
+  await writeRollout(sessionPath, "thread-a", "openai");
+  await writeStateDbWithUserEventColumn(codexHome, [
+    { id: "thread-a", model_provider: "openai", archived: false, has_user_event: false }
+  ]);
+
+  const syncResult = await runSync({ codexHome });
+
+  assert.equal(syncResult.changedSessionFiles, 0);
+  assert.equal(syncResult.sqliteRowsUpdated, 1);
+  assert.equal(syncResult.sqliteUserEventRowsUpdated, 1);
+
+  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  try {
+    const row = db
+      .prepare("SELECT has_user_event FROM threads WHERE id = ?")
+      .get("thread-a");
+    assert.equal(row.has_user_event, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test("runSync repairs SQLite cwd from rollout session metadata", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-cwd.jsonl");
+  await writeCustomRollout(sessionPath, {
+    id: "thread-cwd",
+    timestamp: "2026-03-19T00:00:00.000Z",
+    cwd: "D:\\GitHubProject\\oss-maintainer-hub",
+    source: "vscode",
+    cli_version: "0.115.0",
+    model_provider: "openai"
+  });
+  await writeStateDb(codexHome, [
+    {
+      id: "thread-cwd",
+      model_provider: "openai",
+      archived: false,
+      cwd: "\\\\?\\D:\\GitHubProject\\oss-maintainer-hub"
+    }
+  ]);
+
+  const syncResult = await runSync({ codexHome });
+
+  assert.equal(syncResult.changedSessionFiles, 0);
+  assert.equal(syncResult.sqliteRowsUpdated, 1);
+  assert.equal(syncResult.sqliteCwdRowsUpdated, 1);
+
+  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  try {
+    const row = db
+      .prepare("SELECT cwd FROM threads WHERE id = ?")
+      .get("thread-cwd");
+    assert.equal(row.cwd, "D:\\GitHubProject\\oss-maintainer-hub");
+  } finally {
+    db.close();
+  }
+});
+
+test("runSync normalizes extended rollout cwd before repairing SQLite", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-cwd-extended.jsonl");
+  await writeCustomRollout(sessionPath, {
+    id: "thread-cwd-extended",
+    timestamp: "2026-03-19T00:00:00.000Z",
+    cwd: "\\\\?\\E:\\GitHubProject\\lin-framework",
+    source: "vscode",
+    cli_version: "0.115.0",
+    model_provider: "openai"
+  });
+  await writeStateDb(codexHome, [
+    {
+      id: "thread-cwd-extended",
+      model_provider: "openai",
+      archived: false,
+      cwd: "\\\\?\\E:\\GitHubProject\\lin-framework"
+    }
+  ]);
+
+  const syncResult = await runSync({ codexHome });
+
+  assert.equal(syncResult.sqliteRowsUpdated, 1);
+  assert.equal(syncResult.sqliteCwdRowsUpdated, 1);
+
+  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  try {
+    const row = db
+      .prepare("SELECT cwd FROM threads WHERE id = ?")
+      .get("thread-cwd-extended");
+    assert.equal(row.cwd, "E:\\GitHubProject\\lin-framework");
+  } finally {
+    db.close();
+  }
+});
+
+test("runSync restores workspace roots from project order and normalizes them to Desktop path variants", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const originalState = {
+    "electron-saved-workspace-roots": [
+      "\\\\?\\D:\\GitHubProject\\codex-provider-sync"
+    ],
+    "project-order": [
+      "\\\\?\\D:\\GitHubProject\\codex-provider-sync",
+      "\\\\?\\E:\\NewRich\\BrainLife\\Code\\BrainLife\\Assets"
+    ],
+    "active-workspace-roots": [
+      "\\\\?\\D:\\GitHubProject\\codex-provider-sync"
+    ],
+    "electron-workspace-root-labels": {
+      "\\\\?\\E:\\NewRich\\BrainLife\\Code\\BrainLife\\Assets": "BrainLifeAssets"
+    }
+  };
+  await writeGlobalState(codexHome, originalState);
+  await writeStateDb(codexHome, [
+    {
+      id: "thread-a",
+      model_provider: "openai",
+      archived: false,
+      cwd: "\\\\?\\D:\\GitHubProject\\codex-provider-sync"
+    },
+    {
+      id: "thread-b",
+      model_provider: "openai",
+      archived: false,
+      cwd: "\\\\?\\E:\\NewRich\\BrainLife\\Code\\BrainLife\\Assets"
+    }
+  ]);
+
+  const syncResult = await runSync({ codexHome });
+  assert.equal(syncResult.updatedWorkspaceRoots, 2);
+
+  const syncedState = JSON.parse(await fs.readFile(path.join(codexHome, ".codex-global-state.json"), "utf8"));
+  assert.deepEqual(syncedState["electron-saved-workspace-roots"], [
+    "D:\\GitHubProject\\codex-provider-sync",
+    "E:\\NewRich\\BrainLife\\Code\\BrainLife\\Assets"
+  ]);
+  assert.deepEqual(syncedState["project-order"], [
+    "D:\\GitHubProject\\codex-provider-sync",
+    "E:\\NewRich\\BrainLife\\Code\\BrainLife\\Assets"
+  ]);
+  assert.deepEqual(syncedState["active-workspace-roots"], [
+    "D:\\GitHubProject\\codex-provider-sync"
+  ]);
+  assert.equal(
+    syncedState["electron-workspace-root-labels"]["E:\\NewRich\\BrainLife\\Code\\BrainLife\\Assets"],
+    "BrainLifeAssets"
+  );
+
+  await runRestore({ codexHome, backupDir: syncResult.backupDir });
+
+  const restoredState = JSON.parse(await fs.readFile(path.join(codexHome, ".codex-global-state.json"), "utf8"));
+  assert.deepEqual(restoredState["electron-saved-workspace-roots"], originalState["electron-saved-workspace-roots"]);
+  assert.deepEqual(restoredState["project-order"], originalState["project-order"]);
+});
+
 test("runSwitch updates config and syncs provider metadata", async () => {
   const { codexHome } = await makeTempCodexHome();
   await writeConfig(codexHome);
@@ -313,6 +537,72 @@ test("status reports implicit default provider and rollout/sqlite counts", async
   assert.deepEqual(status.sqliteCounts.archived_sessions, { openai: 1 });
   assert.equal(status.backupSummary.count, 2);
   assert.equal(status.backupSummary.totalBytes, backupOneBytes + backupTwoBytes);
+});
+
+test("status reports pending SQLite user-event and cwd repairs", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-repair-status.jsonl");
+  await writeCustomRollout(sessionPath, {
+    id: "thread-repair-status",
+    timestamp: "2026-03-19T00:00:00.000Z",
+    cwd: "E:\\GitHubProject\\lin-framework",
+    source: "vscode",
+    cli_version: "0.115.0",
+    model_provider: "openai"
+  });
+  await writeStateDbWithUserEventColumn(codexHome, [
+    {
+      id: "thread-repair-status",
+      model_provider: "openai",
+      archived: false,
+      has_user_event: false,
+      cwd: "\\\\?\\E:\\GitHubProject\\lin-framework"
+    }
+  ]);
+
+  const status = await getStatus({ codexHome });
+
+  assert.equal(status.sqliteRepairStats.userEventRowsNeedingRepair, 1);
+  assert.equal(status.sqliteRepairStats.cwdRowsNeedingRepair, 1);
+  assert.match(renderStatus(status), /user-event flags needing repair: 1/);
+  assert.match(renderStatus(status), /cwd paths needing repair: 1/);
+});
+
+test("status reports project visibility ranks and cwd exact-match diagnostics", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "dal"');
+  await writeGlobalState(codexHome, {
+    "electron-saved-workspace-roots": [
+      "E:\\GitHubProject\\lin-framework"
+    ]
+  });
+
+  const unrelatedRows = Array.from({ length: 51 }, (_, index) => ({
+    id: `thread-other-${String(index).padStart(2, "0")}`,
+    cwd: "D:\\OtherProject",
+    updated_at_ms: 1000 - index
+  }));
+  await writeStateDbForProjectVisibility(codexHome, [
+    ...unrelatedRows,
+    {
+      id: "thread-lin",
+      cwd: "\\\\?\\E:\\GitHubProject\\lin-framework",
+      updated_at_ms: 1
+    }
+  ]);
+
+  const status = await getStatus({ codexHome });
+  const [project] = status.projectThreadVisibility;
+
+  assert.equal(project.root, "E:\\GitHubProject\\lin-framework");
+  assert.equal(project.interactiveThreads, 1);
+  assert.equal(project.firstPageThreads, 0);
+  assert.deepEqual(project.ranks, [52]);
+  assert.equal(project.exactCwdMatches, 0);
+  assert.equal(project.verbatimCwdRows, 1);
+  assert.match(renderStatus(status), /Project visibility:/);
+  assert.match(renderStatus(status), /first page 0\/50, ranks 52, exact cwd 0\/1, verbatim cwd 1/);
 });
 
 test("runSwitch rejects unknown custom providers", async () => {

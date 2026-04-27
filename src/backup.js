@@ -5,7 +5,9 @@ import {
   BACKUP_NAMESPACE,
   DB_FILE_BASENAME,
   DEFAULT_BACKUP_RETENTION_COUNT,
-  defaultBackupRoot
+  defaultBackupRoot,
+  GLOBAL_STATE_BACKUP_FILE_BASENAME,
+  GLOBAL_STATE_FILE_BASENAME
 } from "./constants.js";
 import { assertSessionFilesWritable, restoreSessionChanges } from "./session-files.js";
 import { assertSqliteWritable } from "./sqlite-state.js";
@@ -26,6 +28,18 @@ async function copyIfPresent(sourcePath, destinationPath) {
 
 async function removeIfPresent(targetPath) {
   await fs.rm(targetPath, { force: true });
+}
+
+async function backupGlobalStateFiles(codexHome, backupDir) {
+  for (const fileName of [GLOBAL_STATE_FILE_BASENAME, GLOBAL_STATE_BACKUP_FILE_BASENAME]) {
+    await copyIfPresent(path.join(codexHome, fileName), path.join(backupDir, fileName));
+  }
+}
+
+export async function restoreGlobalStateFilesFromBackup(backupDir, codexHome) {
+  for (const fileName of [GLOBAL_STATE_FILE_BASENAME, GLOBAL_STATE_BACKUP_FILE_BASENAME]) {
+    await copyIfPresent(path.join(backupDir, fileName), path.join(codexHome, fileName));
+  }
 }
 
 export async function createBackup({
@@ -54,6 +68,7 @@ export async function createBackup({
   } else {
     await copyIfPresent(configPath, path.join(backupDir, "config.toml"));
   }
+  await backupGlobalStateFiles(codexHome, backupDir);
 
   const sessionManifest = {
     version: 1,
@@ -171,6 +186,7 @@ export async function restoreBackup(backupDir, codexHome, options = {}) {
   const configBackupPath = path.join(backupDir, "config.toml");
   if (restoreConfig) {
     await copyIfPresent(configBackupPath, path.join(codexHome, "config.toml"));
+    await restoreGlobalStateFilesFromBackup(backupDir, codexHome);
   }
 
   if (restoreDatabase) {

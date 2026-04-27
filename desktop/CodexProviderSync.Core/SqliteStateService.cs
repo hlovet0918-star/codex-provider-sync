@@ -78,6 +78,77 @@ public sealed class SqliteStateService
         }
     }
 
+    public async Task<SqliteRepairStats?> ReadSqliteRepairStatsAsync(
+        string codexHome,
+        IReadOnlyCollection<string>? userEventThreadIds = null,
+        IReadOnlyDictionary<string, string>? threadCwdsById = null)
+    {
+        string dbPath = StateDbPath(codexHome);
+        if (!File.Exists(dbPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            await using SqliteConnection connection = OpenConnection(dbPath, SqliteOpenMode.ReadOnly);
+            await connection.OpenAsync();
+
+            int userEventRowsNeedingRepair = 0;
+            if (userEventThreadIds?.Count > 0 && await TableHasColumnAsync(connection, "threads", "has_user_event"))
+            {
+                await using SqliteCommand userEventCommand = connection.CreateCommand();
+                userEventCommand.CommandText = "SELECT has_user_event FROM threads WHERE id = $id";
+                SqliteParameter idParameter = userEventCommand.Parameters.Add("$id", SqliteType.Text);
+                foreach (string threadId in userEventThreadIds)
+                {
+                    idParameter.Value = threadId;
+                    object? value = await userEventCommand.ExecuteScalarAsync();
+                    if (value is not null && value is not DBNull && Convert.ToInt64(value) != 1)
+                    {
+                        userEventRowsNeedingRepair += 1;
+                    }
+                }
+            }
+
+            int cwdRowsNeedingRepair = 0;
+            if (threadCwdsById?.Count > 0 && await TableHasColumnAsync(connection, "threads", "cwd"))
+            {
+                await using SqliteCommand cwdCommand = connection.CreateCommand();
+                cwdCommand.CommandText = "SELECT cwd FROM threads WHERE id = $id";
+                SqliteParameter idParameter = cwdCommand.Parameters.Add("$id", SqliteType.Text);
+                foreach ((string threadId, string expectedCwd) in threadCwdsById)
+                {
+                    if (string.IsNullOrWhiteSpace(threadId) || string.IsNullOrWhiteSpace(expectedCwd))
+                    {
+                        continue;
+                    }
+
+                    idParameter.Value = threadId;
+                    object? value = await cwdCommand.ExecuteScalarAsync();
+                    if (value is not null
+                        && value is not DBNull
+                        && !string.Equals(Convert.ToString(value), expectedCwd, StringComparison.Ordinal))
+                    {
+                        cwdRowsNeedingRepair += 1;
+                    }
+                }
+            }
+
+            return new SqliteRepairStats
+            {
+                UserEventRowsNeedingRepair = userEventRowsNeedingRepair,
+                CwdRowsNeedingRepair = cwdRowsNeedingRepair
+            };
+        }
+        catch (Exception error)
+        {
+            throw WrapSqliteMalformedError(
+                WrapSqliteBusyError(error, "read SQLite repair diagnostics"),
+                "read SQLite repair diagnostics");
+        }
+    }
+
     public async Task<bool> AssertSqliteWritableAsync(string codexHome, int? busyTimeoutMs = null)
     {
         string dbPath = StateDbPath(codexHome);
@@ -103,21 +174,23 @@ public sealed class SqliteStateService
         }
     }
 
-    public async Task<(int UpdatedRows, bool DatabasePresent)> UpdateSqliteProviderAsync(
+    public async Task<(int UpdatedRows, int ProviderRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent)> UpdateSqliteProviderAsync(
         string codexHome,
         string targetProvider,
-        Func<(int UpdatedRows, bool DatabasePresent), Task>? afterUpdate = null,
-        int? busyTimeoutMs = null)
+        Func<(int UpdatedRows, int ProviderRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent), Task>? afterUpdate = null,
+        int? busyTimeoutMs = null,
+        IReadOnlyCollection<string>? userEventThreadIds = null,
+        IReadOnlyDictionary<string, string>? threadCwdsById = null)
     {
         string dbPath = StateDbPath(codexHome);
         if (!File.Exists(dbPath))
         {
             if (afterUpdate is not null)
             {
-                await afterUpdate((0, false));
+                await afterUpdate((0, 0, 0, 0, false));
             }
 
-            return (0, false);
+            return (0, 0, 0, 0, false);
         }
 
         await using SqliteConnection connection = OpenConnection(dbPath, SqliteOpenMode.ReadWriteCreate);
@@ -136,16 +209,58 @@ public sealed class SqliteStateService
                 WHERE COALESCE(model_provider, '') <> $provider
                 """;
             command.Parameters.AddWithValue("$provider", targetProvider);
-            int updatedRows = await command.ExecuteNonQueryAsync();
+            int providerRowsUpdated = await command.ExecuteNonQueryAsync();
+            int userEventRowsUpdated = 0;
+            if (userEventThreadIds?.Count > 0 && await TableHasColumnAsync(connection, "threads", "has_user_event"))
+            {
+                await using SqliteCommand userEventCommand = connection.CreateCommand();
+                userEventCommand.CommandText = """
+                    UPDATE threads
+                    SET has_user_event = 1
+                    WHERE id = $id AND COALESCE(has_user_event, 0) <> 1
+                    """;
+                SqliteParameter idParameter = userEventCommand.Parameters.Add("$id", SqliteType.Text);
+                foreach (string threadId in userEventThreadIds)
+                {
+                    idParameter.Value = threadId;
+                    userEventRowsUpdated += await userEventCommand.ExecuteNonQueryAsync();
+                }
+            }
+
+            int cwdRowsUpdated = 0;
+            if (threadCwdsById?.Count > 0 && await TableHasColumnAsync(connection, "threads", "cwd"))
+            {
+                await using SqliteCommand cwdCommand = connection.CreateCommand();
+                cwdCommand.CommandText = """
+                    UPDATE threads
+                    SET cwd = $cwd
+                    WHERE id = $id AND COALESCE(cwd, '') <> $cwd
+                    """;
+                SqliteParameter cwdIdParameter = cwdCommand.Parameters.Add("$id", SqliteType.Text);
+                SqliteParameter cwdParameter = cwdCommand.Parameters.Add("$cwd", SqliteType.Text);
+                foreach ((string threadId, string cwd) in threadCwdsById)
+                {
+                    if (string.IsNullOrWhiteSpace(threadId) || string.IsNullOrWhiteSpace(cwd))
+                    {
+                        continue;
+                    }
+
+                    cwdIdParameter.Value = threadId;
+                    cwdParameter.Value = cwd;
+                    cwdRowsUpdated += await cwdCommand.ExecuteNonQueryAsync();
+                }
+            }
+
+            int updatedRows = providerRowsUpdated + userEventRowsUpdated + cwdRowsUpdated;
 
             if (afterUpdate is not null)
             {
-                await afterUpdate((updatedRows, true));
+                await afterUpdate((updatedRows, providerRowsUpdated, userEventRowsUpdated, cwdRowsUpdated, true));
             }
 
             await ExecuteNonQueryAsync(connection, "COMMIT");
             transactionOpen = false;
-            return (updatedRows, true);
+            return (updatedRows, providerRowsUpdated, userEventRowsUpdated, cwdRowsUpdated, true);
         }
         catch (Exception error)
         {
@@ -191,7 +306,28 @@ public sealed class SqliteStateService
         await command.ExecuteNonQueryAsync();
     }
 
-    private static Exception WrapSqliteBusyError(Exception error, string action)
+    private static async Task<bool> TableHasColumnAsync(SqliteConnection connection, string tableName, string columnName)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({QuoteIdentifier(tableName)})";
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string QuoteIdentifier(string value)
+    {
+        return "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+    }
+
+    internal static Exception WrapSqliteBusyError(Exception error, string action)
     {
         if (error is not SqliteException sqliteError
             || (sqliteError.SqliteErrorCode != 5 && sqliteError.SqliteErrorCode != 6))
@@ -228,7 +364,7 @@ public sealed class SqliteStateService
                 || sqliteError.Message.Contains("not a database", StringComparison.OrdinalIgnoreCase));
     }
 
-    private static Exception WrapSqliteMalformedError(Exception error, string action)
+    internal static Exception WrapSqliteMalformedError(Exception error, string action)
     {
         if (!IsSqliteMalformedError(error))
         {

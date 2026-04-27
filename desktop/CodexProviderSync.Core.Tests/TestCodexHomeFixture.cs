@@ -46,13 +46,20 @@ internal sealed class TestCodexHomeFixture
         await File.WriteAllTextAsync(Path.Combine(CodexHome, "config.toml"), configText);
     }
 
-    public async Task WriteRolloutAsync(string filePath, string id, string provider)
+    public async Task WriteGlobalStateAsync(object state)
+    {
+        string json = JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }) + "\n";
+        await File.WriteAllTextAsync(Path.Combine(CodexHome, AppConstants.GlobalStateFileBasename), json);
+        await File.WriteAllTextAsync(Path.Combine(CodexHome, AppConstants.GlobalStateBackupFileBasename), json);
+    }
+
+    public async Task WriteRolloutAsync(string filePath, string id, string provider, string cwd = "C:\\AITemp")
     {
         object payload = new
         {
             id,
             timestamp = "2026-03-19T00:00:00.000Z",
-            cwd = "C:\\AITemp",
+            cwd,
             source = "cli",
             cli_version = "0.115.0",
             model_provider = provider
@@ -127,6 +134,7 @@ internal sealed class TestCodexHomeFixture
             CREATE TABLE threads (
               id TEXT PRIMARY KEY,
               model_provider TEXT,
+              cwd TEXT NOT NULL DEFAULT '',
               archived INTEGER NOT NULL DEFAULT 0,
               first_user_message TEXT NOT NULL DEFAULT ''
             )
@@ -137,12 +145,145 @@ internal sealed class TestCodexHomeFixture
         {
             SqliteCommand insert = connection.CreateCommand();
             insert.CommandText = """
-                INSERT INTO threads (id, model_provider, archived, first_user_message)
-                VALUES ($id, $provider, $archived, 'hello')
+                INSERT INTO threads (id, model_provider, cwd, archived, first_user_message)
+                VALUES ($id, $provider, 'C:\AITemp', $archived, 'hello')
                 """;
             insert.Parameters.AddWithValue("$id", id);
             insert.Parameters.AddWithValue("$provider", modelProvider);
             insert.Parameters.AddWithValue("$archived", archived ? 1 : 0);
+            await insert.ExecuteNonQueryAsync();
+        }
+    }
+
+    public async Task WriteStateDbWithUserEventColumnAsync(IEnumerable<(string Id, string ModelProvider, bool Archived, bool HasUserEvent)> rows)
+    {
+        string dbPath = Path.Combine(CodexHome, "state_5.sqlite");
+        await using SqliteConnection connection = OpenSqliteConnection();
+        await connection.OpenAsync();
+        SqliteCommand create = connection.CreateCommand();
+        create.CommandText = """
+            CREATE TABLE threads (
+              id TEXT PRIMARY KEY,
+              model_provider TEXT,
+              cwd TEXT NOT NULL DEFAULT '',
+              archived INTEGER NOT NULL DEFAULT 0,
+              has_user_event INTEGER NOT NULL DEFAULT 0,
+              first_user_message TEXT NOT NULL DEFAULT ''
+            )
+            """;
+        await create.ExecuteNonQueryAsync();
+
+        foreach ((string id, string modelProvider, bool archived, bool hasUserEvent) in rows)
+        {
+            SqliteCommand insert = connection.CreateCommand();
+            insert.CommandText = """
+                INSERT INTO threads (id, model_provider, cwd, archived, has_user_event, first_user_message)
+                VALUES ($id, $provider, 'C:\AITemp', $archived, $hasUserEvent, 'hello')
+                """;
+            insert.Parameters.AddWithValue("$id", id);
+            insert.Parameters.AddWithValue("$provider", modelProvider);
+            insert.Parameters.AddWithValue("$archived", archived ? 1 : 0);
+            insert.Parameters.AddWithValue("$hasUserEvent", hasUserEvent ? 1 : 0);
+            await insert.ExecuteNonQueryAsync();
+        }
+    }
+
+    public async Task WriteStateDbWithUserEventAndCwdAsync(IEnumerable<(string Id, string ModelProvider, bool Archived, bool HasUserEvent, string Cwd)> rows)
+    {
+        await using SqliteConnection connection = OpenSqliteConnection();
+        await connection.OpenAsync();
+        SqliteCommand create = connection.CreateCommand();
+        create.CommandText = """
+            CREATE TABLE threads (
+              id TEXT PRIMARY KEY,
+              model_provider TEXT,
+              cwd TEXT NOT NULL DEFAULT '',
+              archived INTEGER NOT NULL DEFAULT 0,
+              has_user_event INTEGER NOT NULL DEFAULT 0,
+              first_user_message TEXT NOT NULL DEFAULT ''
+            )
+            """;
+        await create.ExecuteNonQueryAsync();
+
+        foreach ((string id, string modelProvider, bool archived, bool hasUserEvent, string cwd) in rows)
+        {
+            SqliteCommand insert = connection.CreateCommand();
+            insert.CommandText = """
+                INSERT INTO threads (id, model_provider, cwd, archived, has_user_event, first_user_message)
+                VALUES ($id, $provider, $cwd, $archived, $hasUserEvent, 'hello')
+                """;
+            insert.Parameters.AddWithValue("$id", id);
+            insert.Parameters.AddWithValue("$provider", modelProvider);
+            insert.Parameters.AddWithValue("$cwd", cwd);
+            insert.Parameters.AddWithValue("$archived", archived ? 1 : 0);
+            insert.Parameters.AddWithValue("$hasUserEvent", hasUserEvent ? 1 : 0);
+            await insert.ExecuteNonQueryAsync();
+        }
+    }
+
+    public async Task WriteStateDbWithCwdAsync(IEnumerable<(string Id, string ModelProvider, bool Archived, string Cwd)> rows)
+    {
+        await using SqliteConnection connection = OpenSqliteConnection();
+        await connection.OpenAsync();
+        SqliteCommand create = connection.CreateCommand();
+        create.CommandText = """
+            CREATE TABLE threads (
+              id TEXT PRIMARY KEY,
+              model_provider TEXT,
+              cwd TEXT NOT NULL DEFAULT '',
+              archived INTEGER NOT NULL DEFAULT 0,
+              first_user_message TEXT NOT NULL DEFAULT ''
+            )
+            """;
+        await create.ExecuteNonQueryAsync();
+
+        foreach ((string id, string modelProvider, bool archived, string cwd) in rows)
+        {
+            SqliteCommand insert = connection.CreateCommand();
+            insert.CommandText = """
+                INSERT INTO threads (id, model_provider, cwd, archived, first_user_message)
+                VALUES ($id, $provider, $cwd, $archived, 'hello')
+                """;
+            insert.Parameters.AddWithValue("$id", id);
+            insert.Parameters.AddWithValue("$provider", modelProvider);
+            insert.Parameters.AddWithValue("$cwd", cwd);
+            insert.Parameters.AddWithValue("$archived", archived ? 1 : 0);
+            await insert.ExecuteNonQueryAsync();
+        }
+    }
+
+    public async Task WriteStateDbForProjectVisibilityAsync(IEnumerable<(string Id, string ModelProvider, string Cwd, string Source, bool Archived, string FirstUserMessage, long UpdatedAtMs)> rows)
+    {
+        await using SqliteConnection connection = OpenSqliteConnection();
+        await connection.OpenAsync();
+        SqliteCommand create = connection.CreateCommand();
+        create.CommandText = """
+            CREATE TABLE threads (
+              id TEXT PRIMARY KEY,
+              model_provider TEXT,
+              cwd TEXT NOT NULL DEFAULT '',
+              source TEXT NOT NULL DEFAULT 'cli',
+              archived INTEGER NOT NULL DEFAULT 0,
+              first_user_message TEXT NOT NULL DEFAULT '',
+              updated_at_ms INTEGER NOT NULL DEFAULT 0
+            )
+            """;
+        await create.ExecuteNonQueryAsync();
+
+        foreach ((string id, string modelProvider, string cwd, string source, bool archived, string firstUserMessage, long updatedAtMs) in rows)
+        {
+            SqliteCommand insert = connection.CreateCommand();
+            insert.CommandText = """
+                INSERT INTO threads (id, model_provider, cwd, source, archived, first_user_message, updated_at_ms)
+                VALUES ($id, $provider, $cwd, $source, $archived, $firstUserMessage, $updatedAtMs)
+                """;
+            insert.Parameters.AddWithValue("$id", id);
+            insert.Parameters.AddWithValue("$provider", modelProvider);
+            insert.Parameters.AddWithValue("$cwd", cwd);
+            insert.Parameters.AddWithValue("$source", source);
+            insert.Parameters.AddWithValue("$archived", archived ? 1 : 0);
+            insert.Parameters.AddWithValue("$firstUserMessage", firstUserMessage);
+            insert.Parameters.AddWithValue("$updatedAtMs", updatedAtMs);
             await insert.ExecuteNonQueryAsync();
         }
     }

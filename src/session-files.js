@@ -63,6 +63,83 @@ async function fileHasEncryptedContent(filePath, firstLine) {
   }
 }
 
+function recordHasUserEvent(record) {
+  if (!record || typeof record !== "object") {
+    return false;
+  }
+  if (record.type === "event_msg" && record.payload?.type === "user_message") {
+    return true;
+  }
+
+  for (const key of ["payload", "item", "msg"]) {
+    const value = record[key];
+    if (value?.type === "message" && value.role === "user") {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function toDesktopWorkspacePath(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return value;
+  }
+
+  const extendedUnc = trimmed.match(/^\\\\\?\\UNC\\(.+)$/i);
+  if (extendedUnc) {
+    return `\\\\${extendedUnc[1]}`.replace(/\//g, "\\");
+  }
+
+  const extendedDrive = trimmed.match(/^\\\\\?\\([A-Za-z]:)(?:[\\/](.*))?$/);
+  if (extendedDrive) {
+    const [, drive, rest] = extendedDrive;
+    return rest && rest.length > 0
+      ? `${drive}\\${rest.replace(/\//g, "\\")}`
+      : `${drive}\\`;
+  }
+
+  if (trimmed.startsWith("\\\\?\\")) {
+    return trimmed.slice(4).replace(/\//g, "\\");
+  }
+
+  return value;
+}
+
+async function fileHasUserEvent(filePath, firstLine) {
+  try {
+    if (recordHasUserEvent(JSON.parse(firstLine))) {
+      return true;
+    }
+  } catch {
+    // Keep scanning the rest of the rollout below.
+  }
+
+  try {
+    const content = await fsp.readFile(filePath, "utf8");
+    for (const line of content.split(/\r?\n/)) {
+      if (!line) {
+        continue;
+      }
+      try {
+        if (recordHasUserEvent(JSON.parse(line))) {
+          return true;
+        }
+      } catch {
+        // Ignore malformed non-metadata lines; provider sync only needs positive evidence.
+      }
+    }
+    return false;
+  } catch (error) {
+    throw wrapRolloutFileBusyError(error, filePath, "scan");
+  }
+}
+
 async function listJsonlFiles(rootDir) {
   const entries = await fsp.readdir(rootDir, { withFileTypes: true });
   const files = [];
@@ -500,6 +577,8 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
     archived_sessions: new Map()
   };
   const encryptedContentCounts = emptyEncryptedContentCounts();
+  const userEventThreadIds = new Set();
+  const threadCwdById = new Map();
 
   for (const dirName of SESSION_DIRS) {
     const rootDir = path.join(codexHome, dirName);
@@ -526,9 +605,18 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
       }
       const currentProvider = parsed.payload.model_provider ?? "(missing)";
       providerCounts[dirName].set(currentProvider, (providerCounts[dirName].get(currentProvider) ?? 0) + 1);
+      if (typeof parsed.payload.id === "string"
+          && parsed.payload.id
+          && typeof parsed.payload.cwd === "string"
+          && parsed.payload.cwd.trim()) {
+        threadCwdById.set(parsed.payload.id, toDesktopWorkspacePath(parsed.payload.cwd));
+      }
       try {
         if (await fileHasEncryptedContent(rolloutPath, record.firstLine)) {
           incrementPlainCount(encryptedContentCounts, dirName, currentProvider);
+        }
+        if (parsed.payload.id && await fileHasUserEvent(rolloutPath, record.firstLine)) {
+          userEventThreadIds.add(parsed.payload.id);
         }
       } catch (error) {
         if (skipLockedReads && isRolloutFileBusyError(error)) {
@@ -557,7 +645,7 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
     }
   }
 
-  return { changes: summaries, lockedPaths, providerCounts, encryptedContentCounts };
+  return { changes: summaries, lockedPaths, providerCounts, encryptedContentCounts, userEventThreadIds, threadCwdById };
 }
 
 export async function applySessionChanges(changes) {

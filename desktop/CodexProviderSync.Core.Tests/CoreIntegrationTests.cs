@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 
 namespace CodexProviderSync.Core.Tests;
@@ -85,6 +86,170 @@ public sealed class CoreIntegrationTests
     }
 
     [Fact]
+    public async Task RunSync_RepairsSqliteHasUserEventFromRolloutUserMessages()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync("model_provider = \"openai\"");
+        string sessionPath = fixture.RolloutPath("sessions", "rollout-a.jsonl");
+        await fixture.WriteRolloutAsync(sessionPath, "thread-a", "openai");
+        await fixture.WriteStateDbWithUserEventColumnAsync(
+        [
+            ("thread-a", "openai", false, false)
+        ]);
+
+        CodexSyncService service = new();
+        SyncResult result = await service.RunSyncAsync(fixture.CodexHome);
+
+        Assert.Equal(0, result.ChangedSessionFiles);
+        Assert.Equal(1, result.SqliteRowsUpdated);
+        Assert.Equal(1, result.SqliteUserEventRowsUpdated);
+
+        await using SqliteConnection connection = fixture.OpenSqliteConnection();
+        await connection.OpenAsync();
+        SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "SELECT has_user_event FROM threads WHERE id = 'thread-a'";
+        long hasUserEvent = (long)(await command.ExecuteScalarAsync())!;
+        Assert.Equal(1, hasUserEvent);
+    }
+
+    [Fact]
+    public async Task RunSync_RepairsSqliteCwdFromRolloutSessionMetadata()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync("model_provider = \"openai\"");
+        string sessionPath = fixture.RolloutPath("sessions", "rollout-cwd.jsonl");
+        await fixture.WriteRolloutAsync(
+            sessionPath,
+            "thread-cwd",
+            "openai",
+            @"D:\GitHubProject\oss-maintainer-hub");
+        await fixture.WriteStateDbWithCwdAsync(
+        [
+            ("thread-cwd", "openai", false, @"\\?\D:\GitHubProject\oss-maintainer-hub")
+        ]);
+
+        CodexSyncService service = new();
+        SyncResult result = await service.RunSyncAsync(fixture.CodexHome);
+
+        Assert.Equal(0, result.ChangedSessionFiles);
+        Assert.Equal(1, result.SqliteRowsUpdated);
+        Assert.Equal(1, result.SqliteCwdRowsUpdated);
+
+        await using SqliteConnection connection = fixture.OpenSqliteConnection();
+        await connection.OpenAsync();
+        SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "SELECT cwd FROM threads WHERE id = 'thread-cwd'";
+        string cwd = (string)(await command.ExecuteScalarAsync())!;
+        Assert.Equal(@"D:\GitHubProject\oss-maintainer-hub", cwd);
+    }
+
+    [Fact]
+    public async Task RunSync_NormalizesExtendedRolloutCwd_BeforeRepairingSqlite()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync("model_provider = \"openai\"");
+        string sessionPath = fixture.RolloutPath("sessions", "rollout-cwd-extended.jsonl");
+        await fixture.WriteRolloutAsync(
+            sessionPath,
+            "thread-cwd-extended",
+            "openai",
+            @"\\?\E:\GitHubProject\lin-framework");
+        await fixture.WriteStateDbWithCwdAsync(
+        [
+            ("thread-cwd-extended", "openai", false, @"\\?\E:\GitHubProject\lin-framework")
+        ]);
+
+        CodexSyncService service = new();
+        SyncResult result = await service.RunSyncAsync(fixture.CodexHome);
+
+        Assert.Equal(1, result.SqliteRowsUpdated);
+        Assert.Equal(1, result.SqliteCwdRowsUpdated);
+
+        await using SqliteConnection connection = fixture.OpenSqliteConnection();
+        await connection.OpenAsync();
+        SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "SELECT cwd FROM threads WHERE id = 'thread-cwd-extended'";
+        string cwd = (string)(await command.ExecuteScalarAsync())!;
+        Assert.Equal(@"E:\GitHubProject\lin-framework", cwd);
+    }
+
+    [Fact]
+    public async Task RunSync_RestoresWorkspaceRootsFromProjectOrder_NormalizesForDesktop_AndRestoreRevertsGlobalState()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync("model_provider = \"openai\"");
+        await fixture.WriteGlobalStateAsync(new Dictionary<string, object?>
+        {
+            ["electron-saved-workspace-roots"] = new[]
+            {
+                @"\\?\D:\GitHubProject\codex-provider-sync"
+            },
+            ["project-order"] = new[]
+            {
+                @"\\?\D:\GitHubProject\codex-provider-sync",
+                @"\\?\E:\NewRich\BrainLife\Code\BrainLife\Assets"
+            },
+            ["active-workspace-roots"] = new[]
+            {
+                @"\\?\D:\GitHubProject\codex-provider-sync"
+            },
+            ["electron-workspace-root-labels"] = new Dictionary<string, string>
+            {
+                [@"\\?\E:\NewRich\BrainLife\Code\BrainLife\Assets"] = "BrainLifeAssets"
+            }
+        });
+        await fixture.WriteStateDbWithCwdAsync(
+        [
+            ("thread-a", "openai", false, @"\\?\D:\GitHubProject\codex-provider-sync"),
+            ("thread-b", "openai", false, @"\\?\E:\NewRich\BrainLife\Code\BrainLife\Assets")
+        ]);
+
+        CodexSyncService service = new();
+        SyncResult syncResult = await service.RunSyncAsync(fixture.CodexHome);
+
+        Assert.Equal(2, syncResult.UpdatedWorkspaceRoots);
+
+        JsonDocument syncedState = JsonDocument.Parse(
+            await File.ReadAllTextAsync(Path.Combine(fixture.CodexHome, AppConstants.GlobalStateFileBasename)));
+        Assert.Equal(
+        [
+            @"D:\GitHubProject\codex-provider-sync",
+            @"E:\NewRich\BrainLife\Code\BrainLife\Assets"
+        ],
+            syncedState.RootElement.GetProperty("electron-saved-workspace-roots").EnumerateArray().Select(static entry => entry.GetString()!).ToArray());
+        Assert.Equal(
+        [
+            @"D:\GitHubProject\codex-provider-sync",
+            @"E:\NewRich\BrainLife\Code\BrainLife\Assets"
+        ],
+            syncedState.RootElement.GetProperty("project-order").EnumerateArray().Select(static entry => entry.GetString()!).ToArray());
+        Assert.Equal(
+            @"D:\GitHubProject\codex-provider-sync",
+            syncedState.RootElement.GetProperty("active-workspace-roots")[0].GetString());
+        Assert.Equal(
+            "BrainLifeAssets",
+            syncedState.RootElement.GetProperty("electron-workspace-root-labels")
+                .GetProperty(@"E:\NewRich\BrainLife\Code\BrainLife\Assets")
+                .GetString());
+
+        await service.RunRestoreAsync(fixture.CodexHome, syncResult.BackupDir);
+
+        JsonDocument restoredState = JsonDocument.Parse(
+            await File.ReadAllTextAsync(Path.Combine(fixture.CodexHome, AppConstants.GlobalStateFileBasename)));
+        Assert.Equal(
+        [
+            @"\\?\D:\GitHubProject\codex-provider-sync"
+        ],
+            restoredState.RootElement.GetProperty("electron-saved-workspace-roots").EnumerateArray().Select(static entry => entry.GetString()!).ToArray());
+        Assert.Equal(
+        [
+            @"\\?\D:\GitHubProject\codex-provider-sync",
+            @"\\?\E:\NewRich\BrainLife\Code\BrainLife\Assets"
+        ],
+            restoredState.RootElement.GetProperty("project-order").EnumerateArray().Select(static entry => entry.GetString()!).ToArray());
+    }
+
+    [Fact]
     public async Task GetStatus_ReportsImplicitDefaultProviderAndCounts()
     {
         TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
@@ -110,6 +275,70 @@ public sealed class CoreIntegrationTests
         Assert.Equal(1, status.SqliteCounts!.ArchivedSessions["openai"]);
         Assert.Equal(2, status.BackupSummary.Count);
         Assert.Equal(backupOneBytes + backupTwoBytes, status.BackupSummary.TotalBytes);
+    }
+
+    [Fact]
+    public async Task GetStatus_ReportsPendingSqliteUserEventAndCwdRepairs()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync("model_provider = \"openai\"");
+        string sessionPath = fixture.RolloutPath("sessions", "rollout-repair-status.jsonl");
+        await fixture.WriteRolloutAsync(
+            sessionPath,
+            "thread-repair-status",
+            "openai",
+            @"E:\GitHubProject\lin-framework");
+        await fixture.WriteStateDbWithUserEventAndCwdAsync(
+        [
+            ("thread-repair-status", "openai", false, false, @"\\?\E:\GitHubProject\lin-framework")
+        ]);
+
+        CodexSyncService service = new();
+        StatusSnapshot status = await service.GetStatusAsync(fixture.CodexHome);
+
+        Assert.NotNull(status.SqliteRepairStats);
+        Assert.Equal(1, status.SqliteRepairStats!.UserEventRowsNeedingRepair);
+        Assert.Equal(1, status.SqliteRepairStats.CwdRowsNeedingRepair);
+        string formatted = TextFormatter.FormatStatus(status);
+        Assert.Contains("user-event flags needing repair: 1", formatted);
+        Assert.Contains("cwd paths needing repair: 1", formatted);
+    }
+
+    [Fact]
+    public async Task GetStatus_ReportsProjectVisibilityRanksAndCwdExactMatchDiagnostics()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync("model_provider = \"dal\"");
+        await fixture.WriteGlobalStateAsync(new Dictionary<string, object?>
+        {
+            ["electron-saved-workspace-roots"] = new[]
+            {
+                @"E:\GitHubProject\lin-framework"
+            }
+        });
+
+        List<(string Id, string ModelProvider, string Cwd, string Source, bool Archived, string FirstUserMessage, long UpdatedAtMs)> rows = [];
+        for (int index = 0; index < 51; index += 1)
+        {
+            rows.Add(($"thread-other-{index:00}", "dal", @"D:\OtherProject", "cli", false, "hello", 1000 - index));
+        }
+        rows.Add(("thread-lin", "dal", @"\\?\E:\GitHubProject\lin-framework", "cli", false, "hello", 1));
+        await fixture.WriteStateDbForProjectVisibilityAsync(rows);
+
+        CodexSyncService service = new();
+        StatusSnapshot status = await service.GetStatusAsync(fixture.CodexHome);
+        ProjectThreadVisibility project = Assert.Single(status.ProjectThreadVisibility);
+
+        Assert.Equal(@"E:\GitHubProject\lin-framework", project.Root);
+        Assert.Equal(1, project.InteractiveThreads);
+        Assert.Equal(0, project.FirstPageThreads);
+        Assert.Equal([52], project.Ranks);
+        Assert.Equal(0, project.ExactCwdMatches);
+        Assert.Equal(1, project.VerbatimCwdRows);
+
+        string formatted = TextFormatter.FormatStatus(status);
+        Assert.Contains("Project visibility:", formatted);
+        Assert.Contains("first page 0/50, ranks 52, exact cwd 0/1, verbatim cwd 1", formatted);
     }
 
     [Fact]

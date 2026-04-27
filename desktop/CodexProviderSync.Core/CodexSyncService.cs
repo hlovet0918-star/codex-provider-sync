@@ -6,6 +6,7 @@ public sealed class CodexSyncService
     private readonly ConfigFileService _configFileService;
     private readonly SessionRolloutService _sessionRolloutService;
     private readonly SqliteStateService _sqliteStateService;
+    private readonly GlobalStateService _globalStateService;
     private readonly BackupService _backupService;
     private readonly LockService _lockService;
     private readonly ProviderDiscoveryService _providerDiscoveryService;
@@ -16,6 +17,7 @@ public sealed class CodexSyncService
             new ConfigFileService(),
             new SessionRolloutService(),
             new SqliteStateService(),
+            new GlobalStateService(),
             new LockService(),
             new ProviderDiscoveryService())
     {
@@ -26,6 +28,7 @@ public sealed class CodexSyncService
         ConfigFileService configFileService,
         SessionRolloutService sessionRolloutService,
         SqliteStateService sqliteStateService,
+        GlobalStateService globalStateService,
         LockService lockService,
         ProviderDiscoveryService providerDiscoveryService)
     {
@@ -33,6 +36,7 @@ public sealed class CodexSyncService
         _configFileService = configFileService;
         _sessionRolloutService = sessionRolloutService;
         _sqliteStateService = sqliteStateService;
+        _globalStateService = globalStateService;
         _lockService = lockService;
         _providerDiscoveryService = providerDiscoveryService;
         _backupService = new BackupService(sessionRolloutService, sqliteStateService);
@@ -47,6 +51,15 @@ public sealed class CodexSyncService
         IReadOnlyList<string> configuredProviders = _configFileService.ListConfiguredProviderIds(configText);
         SessionChangeCollection rolloutInfo = await _sessionRolloutService.CollectSessionChangesAsync(codexHome, "__status_only__", skipLockedReads: true);
         ProviderCounts? sqliteCounts = await _sqliteStateService.ReadSqliteProviderCountsAsync(codexHome);
+        SqliteRepairStats? sqliteRepairStats = sqliteCounts is not null && !sqliteCounts.Unreadable
+            ? await _sqliteStateService.ReadSqliteRepairStatsAsync(
+                codexHome,
+                rolloutInfo.UserEventThreadIds,
+                rolloutInfo.ThreadCwdsById)
+            : null;
+        IReadOnlyList<ProjectThreadVisibility> projectThreadVisibility = sqliteCounts?.Unreadable == true
+            ? []
+            : await _globalStateService.ReadProjectThreadVisibilityAsync(codexHome);
         BackupSummary backupSummary = await _backupService.GetBackupSummaryAsync(codexHome);
 
         return new StatusSnapshot
@@ -59,6 +72,8 @@ public sealed class CodexSyncService
             EncryptedContentCounts = rolloutInfo.EncryptedContentCounts,
             EncryptedContentWarning = BuildEncryptedContentWarning(rolloutInfo.EncryptedContentCounts, currentProvider.Provider),
             SqliteCounts = sqliteCounts,
+            SqliteRepairStats = sqliteRepairStats,
+            ProjectThreadVisibility = projectThreadVisibility,
             BackupRoot = _codexHomeService.BackupRoot(codexHome),
             BackupSummary = backupSummary
         };
@@ -96,6 +111,7 @@ public sealed class CodexSyncService
         await using LockHandle _ = await _lockService.AcquireLockAsync(codexHome, "sync");
 
         SessionChangeCollection sessionInfo = await _sessionRolloutService.CollectSessionChangesAsync(codexHome, targetProvider, skipLockedReads: true);
+        IReadOnlyList<ThreadCwdStat> workspaceCwdStats = await _globalStateService.ReadThreadCwdStatsAsync(codexHome);
         string? encryptedContentWarning = BuildEncryptedContentWarning(sessionInfo.EncryptedContentCounts, targetProvider);
         (IReadOnlyList<SessionChange> writableChanges, IReadOnlyList<SessionChange> lockedChanges) =
             await _sessionRolloutService.SplitLockedSessionChangesAsync(sessionInfo.Changes);
@@ -107,26 +123,36 @@ public sealed class CodexSyncService
 
         bool sessionRestoreNeeded = false;
         List<SessionChange> appliedSessionChanges = [];
+        bool globalStateRestoreNeeded = false;
+        WorkspaceRootSyncResult workspaceRootResult = new()
+        {
+            Present = false,
+            Updated = false,
+            UpdatedWorkspaceRoots = 0,
+            SavedWorkspaceRootCount = 0
+        };
         try
         {
             SessionApplyResult? applyResult = null;
-            (int updatedRows, bool databasePresent) = await _sqliteStateService.UpdateSqliteProviderAsync(
+            (int updatedRows, int providerRowsUpdated, int userEventRowsUpdated, int cwdRowsUpdated, bool databasePresent) = await _sqliteStateService.UpdateSqliteProviderAsync(
                 codexHome,
                 targetProvider,
                 async _ =>
                 {
-                    if (writableChanges.Count == 0)
+                    if (writableChanges.Count > 0)
                     {
-                        return;
+                        applyResult = await _sessionRolloutService.ApplySessionChangesAsync(writableChanges);
+                        HashSet<string> appliedPathSet = new(applyResult.AppliedPaths, StringComparer.Ordinal);
+                        appliedSessionChanges = writableChanges.Where(change => appliedPathSet.Contains(change.Path)).ToList();
+                        sessionRestoreNeeded = appliedSessionChanges.Count > 0;
+                        await _backupService.UpdateSessionBackupManifestAsync(backupDir, appliedSessionChanges);
                     }
-
-                    applyResult = await _sessionRolloutService.ApplySessionChangesAsync(writableChanges);
-                    HashSet<string> appliedPathSet = new(applyResult.AppliedPaths, StringComparer.Ordinal);
-                    appliedSessionChanges = writableChanges.Where(change => appliedPathSet.Contains(change.Path)).ToList();
-                    sessionRestoreNeeded = appliedSessionChanges.Count > 0;
-                    await _backupService.UpdateSessionBackupManifestAsync(backupDir, appliedSessionChanges);
+                    workspaceRootResult = await _globalStateService.SyncWorkspaceRootsAsync(codexHome, workspaceCwdStats);
+                    globalStateRestoreNeeded = workspaceRootResult.Updated;
                 },
-                sqliteBusyTimeoutMs);
+                sqliteBusyTimeoutMs,
+                sessionInfo.UserEventThreadIds,
+                sessionInfo.ThreadCwdsById);
 
             skippedRolloutFiles.AddRange(applyResult?.SkippedPaths ?? []);
             skippedRolloutFiles = skippedRolloutFiles.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
@@ -151,6 +177,11 @@ public sealed class CodexSyncService
                 ChangedSessionFiles = applyResult?.AppliedCount ?? 0,
                 SkippedLockedRolloutFiles = skippedRolloutFiles,
                 SqliteRowsUpdated = updatedRows,
+                SqliteProviderRowsUpdated = providerRowsUpdated,
+                SqliteUserEventRowsUpdated = userEventRowsUpdated,
+                SqliteCwdRowsUpdated = cwdRowsUpdated,
+                UpdatedWorkspaceRoots = workspaceRootResult.UpdatedWorkspaceRoots,
+                SavedWorkspaceRootCount = workspaceRootResult.SavedWorkspaceRootCount,
                 SqlitePresent = databasePresent,
                 RolloutCountsBefore = sessionInfo.ProviderCounts,
                 EncryptedContentCounts = sessionInfo.EncryptedContentCounts,
@@ -159,11 +190,37 @@ public sealed class CodexSyncService
                 AutoPruneWarning = autoPruneWarning
             };
         }
-        catch
+        catch (Exception error)
         {
+            List<string> restoreFailures = [];
             if (sessionRestoreNeeded)
             {
-                await _sessionRolloutService.RestoreSessionChangesAsync(appliedSessionChanges);
+                try
+                {
+                    await _sessionRolloutService.RestoreSessionChangesAsync(appliedSessionChanges);
+                }
+                catch (Exception restoreError)
+                {
+                    restoreFailures.Add($"rollout files: {restoreError.Message}");
+                }
+            }
+            if (globalStateRestoreNeeded)
+            {
+                try
+                {
+                    await _backupService.RestoreGlobalStateFilesAsync(backupDir, codexHome);
+                }
+                catch (Exception restoreError)
+                {
+                    restoreFailures.Add($"global state: {restoreError.Message}");
+                }
+            }
+
+            if (restoreFailures.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to restore state after sync error. Original error: {error.Message}. Restore error: {string.Join("; ", restoreFailures)}",
+                    error);
             }
 
             throw;
@@ -206,6 +263,11 @@ public sealed class CodexSyncService
                 ChangedSessionFiles = result.ChangedSessionFiles,
                 SkippedLockedRolloutFiles = result.SkippedLockedRolloutFiles,
                 SqliteRowsUpdated = result.SqliteRowsUpdated,
+                SqliteProviderRowsUpdated = result.SqliteProviderRowsUpdated,
+                SqliteUserEventRowsUpdated = result.SqliteUserEventRowsUpdated,
+                SqliteCwdRowsUpdated = result.SqliteCwdRowsUpdated,
+                UpdatedWorkspaceRoots = result.UpdatedWorkspaceRoots,
+                SavedWorkspaceRootCount = result.SavedWorkspaceRootCount,
                 SqlitePresent = result.SqlitePresent,
                 RolloutCountsBefore = result.RolloutCountsBefore,
                 EncryptedContentCounts = result.EncryptedContentCounts,

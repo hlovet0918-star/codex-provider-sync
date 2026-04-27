@@ -19,6 +19,8 @@ public sealed class SessionRolloutService
         Dictionary<string, int> archivedCounts = new(StringComparer.Ordinal);
         Dictionary<string, int> encryptedSessionCounts = new(StringComparer.Ordinal);
         Dictionary<string, int> encryptedArchivedCounts = new(StringComparer.Ordinal);
+        HashSet<string> userEventThreadIds = new(StringComparer.Ordinal);
+        Dictionary<string, string> threadCwdsById = new(StringComparer.Ordinal);
 
         foreach (string dirName in AppConstants.SessionDirectories)
         {
@@ -49,10 +51,22 @@ public sealed class SessionRolloutService
                 string currentProvider = payload!["model_provider"]?.GetValue<string>() ?? "(missing)";
                 Dictionary<string, int> bucket = dirName == "archived_sessions" ? archivedCounts : sessionCounts;
                 bucket[currentProvider] = bucket.TryGetValue(currentProvider, out int count) ? count + 1 : 1;
+                if (payload["id"]?.GetValue<string>() is string metadataThreadId
+                    && !string.IsNullOrWhiteSpace(metadataThreadId)
+                    && payload["cwd"]?.GetValue<string>() is string metadataCwd
+                    && !string.IsNullOrWhiteSpace(metadataCwd))
+                {
+                    threadCwdsById[metadataThreadId] = ToDesktopWorkspacePath(metadataCwd);
+                }
                 bool hasEncryptedContent;
                 try
                 {
                     hasEncryptedContent = await FileHasEncryptedContentAsync(rolloutPath, record.FirstLine);
+                    if (payload["id"]?.GetValue<string>() is string threadId
+                        && await FileHasUserEventAsync(rolloutPath, record.FirstLine))
+                    {
+                        userEventThreadIds.Add(threadId);
+                    }
                 }
                 catch (Exception error) when (skipLockedReads && IsRolloutFileBusyError(error))
                 {
@@ -101,7 +115,9 @@ public sealed class SessionRolloutService
             {
                 Sessions = encryptedSessionCounts,
                 ArchivedSessions = encryptedArchivedCounts
-            }
+            },
+            UserEventThreadIds = userEventThreadIds,
+            ThreadCwdsById = threadCwdsById
         };
     }
 
@@ -442,6 +458,118 @@ public sealed class SessionRolloutService
         {
             throw WrapRolloutFileBusyError(error, filePath, "scan");
         }
+    }
+
+    private static async Task<bool> FileHasUserEventAsync(string filePath, string firstLine)
+    {
+        try
+        {
+            if (RecordHasUserEvent(JsonNode.Parse(firstLine)))
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            // Keep scanning the rest of the rollout below.
+        }
+
+        try
+        {
+            string text = await File.ReadAllTextAsync(filePath);
+            foreach (string rawLine in text.Split('\n'))
+            {
+                string line = rawLine.TrimEnd('\r');
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (RecordHasUserEvent(JsonNode.Parse(line)))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // Ignore malformed non-metadata lines; provider sync only needs positive evidence.
+                }
+            }
+
+            return false;
+        }
+        catch (Exception error)
+        {
+            throw WrapRolloutFileBusyError(error, filePath, "scan");
+        }
+    }
+
+    private static bool RecordHasUserEvent(JsonNode? record)
+    {
+        if (record is not JsonObject root)
+        {
+            return false;
+        }
+
+        if (string.Equals(GetString(root["type"]), "event_msg", StringComparison.Ordinal)
+            && root["payload"] is JsonObject eventPayload
+            && string.Equals(GetString(eventPayload["type"]), "user_message", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        foreach (string key in new[] { "payload", "item", "msg" })
+        {
+            if (root[key] is JsonObject value
+                && string.Equals(GetString(value["type"]), "message", StringComparison.Ordinal)
+                && string.Equals(GetString(value["role"]), "user", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string? GetString(JsonNode? node)
+    {
+        try
+        {
+            return node?.GetValue<string>();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string ToDesktopWorkspacePath(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+
+        string trimmed = value.Trim();
+        if (trimmed.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+        {
+            return @"\\" + trimmed[8..].Replace('/', '\\');
+        }
+
+        if (trimmed.StartsWith(@"\\?\", StringComparison.Ordinal))
+        {
+            string withoutPrefix = trimmed[4..].Replace('/', '\\');
+            if (withoutPrefix.Length == 2 && char.IsLetter(withoutPrefix[0]) && withoutPrefix[1] == ':')
+            {
+                return withoutPrefix + "\\";
+            }
+
+            return withoutPrefix;
+        }
+
+        return value;
     }
 
     private static void TryRestoreLastWriteTimeUtc(string filePath, long? ticks)
