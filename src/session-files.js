@@ -3,11 +3,13 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 import { promisify } from "node:util";
 
 import { SESSION_DIRS } from "./constants.js";
 
 const execFileAsync = promisify(execFile);
+const ROLLOUT_SCAN_CHUNK_BYTES = 1024 * 1024;
 
 function isRolloutFileBusyError(error) {
   const message = `${error?.code ?? ""} ${error?.message ?? ""}`.toLowerCase();
@@ -51,16 +53,58 @@ function incrementPlainCount(counts, directory, provider) {
   counts[directory][provider] = (counts[directory][provider] ?? 0) + 1;
 }
 
-async function fileHasEncryptedContent(filePath, firstLine) {
+function streamContainsText(filePath, text, startOffset) {
+  const needle = Buffer.from(text);
+  const safeStartOffset = Math.max(0, startOffset ?? 0);
+
+  return new Promise((resolve, reject) => {
+    let previous = Buffer.alloc(0);
+    let settled = false;
+    const stream = fs.createReadStream(filePath, {
+      start: safeStartOffset,
+      highWaterMark: ROLLOUT_SCAN_CHUNK_BYTES
+    });
+
+    function settle(value, error) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (error) {
+        reject(wrapRolloutFileBusyError(error, filePath, "scan"));
+        return;
+      }
+      resolve(value);
+    }
+
+    stream.on("data", (chunk) => {
+      const buffer = previous.length ? Buffer.concat([previous, chunk]) : chunk;
+      if (buffer.indexOf(needle) !== -1) {
+        settle(true);
+        stream.destroy();
+        return;
+      }
+
+      const keepBytes = Math.max(0, needle.length - 1);
+      previous = keepBytes > 0
+        ? buffer.subarray(Math.max(0, buffer.length - keepBytes))
+        : Buffer.alloc(0);
+    });
+    stream.on("end", () => settle(false));
+    stream.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settle(false, error);
+    });
+  });
+}
+
+async function fileHasEncryptedContent(filePath, firstLine, startOffset) {
   if (firstLine.includes("encrypted_content")) {
     return true;
   }
-  try {
-    const content = await fsp.readFile(filePath, "utf8");
-    return content.includes("encrypted_content");
-  } catch (error) {
-    throw wrapRolloutFileBusyError(error, filePath, "scan");
-  }
+  return streamContainsText(filePath, "encrypted_content", startOffset);
 }
 
 function recordHasUserEvent(record) {
@@ -111,7 +155,7 @@ function toDesktopWorkspacePath(value) {
   return value;
 }
 
-async function fileHasUserEvent(filePath, firstLine) {
+async function fileHasUserEvent(filePath, firstLine, startOffset) {
   try {
     if (recordHasUserEvent(JSON.parse(firstLine))) {
       return true;
@@ -120,9 +164,18 @@ async function fileHasUserEvent(filePath, firstLine) {
     // Keep scanning the rest of the rollout below.
   }
 
+  const stream = fs.createReadStream(filePath, {
+    encoding: "utf8",
+    start: Math.max(0, startOffset ?? 0),
+    highWaterMark: ROLLOUT_SCAN_CHUNK_BYTES
+  });
+  const lines = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity
+  });
+
   try {
-    const content = await fsp.readFile(filePath, "utf8");
-    for (const line of content.split(/\r?\n/)) {
+    for await (const line of lines) {
       if (!line) {
         continue;
       }
@@ -137,6 +190,9 @@ async function fileHasUserEvent(filePath, firstLine) {
     return false;
   } catch (error) {
     throw wrapRolloutFileBusyError(error, filePath, "scan");
+  } finally {
+    lines.close();
+    stream.destroy();
   }
 }
 
@@ -612,10 +668,10 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
         threadCwdById.set(parsed.payload.id, toDesktopWorkspacePath(parsed.payload.cwd));
       }
       try {
-        if (await fileHasEncryptedContent(rolloutPath, record.firstLine)) {
+        if (await fileHasEncryptedContent(rolloutPath, record.firstLine, record.offset)) {
           incrementPlainCount(encryptedContentCounts, dirName, currentProvider);
         }
-        if (parsed.payload.id && await fileHasUserEvent(rolloutPath, record.firstLine)) {
+        if (parsed.payload.id && await fileHasUserEvent(rolloutPath, record.firstLine, record.offset)) {
           userEventThreadIds.add(parsed.payload.id);
         }
       } catch (error) {

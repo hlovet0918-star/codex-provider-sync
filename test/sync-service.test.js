@@ -780,6 +780,52 @@ test("collectSessionChanges reports encrypted_content counts by provider and sco
   });
 });
 
+test("collectSessionChanges scans large rollout content without full-file reads", async (t) => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-streamed.jsonl");
+  const payload = {
+    id: "thread-streamed",
+    timestamp: "2026-03-19T00:00:00.000Z",
+    cwd: "C:\\AITemp",
+    source: "cli",
+    cli_version: "0.115.0",
+    model_provider: "apigather"
+  };
+  await fs.writeFile(
+    sessionPath,
+    `${JSON.stringify({ timestamp: payload.timestamp, type: "session_meta", payload })}\n`,
+    "utf8"
+  );
+
+  const chunkBytes = 1024 * 1024;
+  const tokenPrefix = "encrypted_";
+  await fs.appendFile(
+    sessionPath,
+    `${"x".repeat(chunkBytes - tokenPrefix.length)}${tokenPrefix}content\n${JSON.stringify({
+      type: "event_msg",
+      payload: { type: "user_message", message: "after large content" }
+    })}\n`,
+    "utf8"
+  );
+
+  const originalReadFile = fs.readFile;
+  t.mock.method(fs, "readFile", async (filePath, ...args) => {
+    if (path.resolve(String(filePath)) === path.resolve(sessionPath)) {
+      throw new Error("rollout scan should not read the full file");
+    }
+    return originalReadFile.call(fs, filePath, ...args);
+  });
+
+  const { encryptedContentCounts, userEventThreadIds } = await collectSessionChanges(codexHome, "openai");
+
+  assert.deepEqual(encryptedContentCounts, {
+    sessions: { apigather: 1 },
+    archived_sessions: {}
+  });
+  assert.equal(userEventThreadIds.has("thread-streamed"), true);
+});
+
 test("applySessionChanges skips only the rollout file that becomes locked on Windows", async () => {
   if (process.platform !== "win32") {
     return;
