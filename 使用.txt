@@ -1,0 +1,19 @@
+npm install -g github:Dailin521/codex-provider-sync
+codex-provider status
+codex-provider sync
+
+执行顺序就是：
+
+切到公司 Provider
+退出 Codex
+安装 codex-provider-sync
+执行 codex-provider status
+执行 codex-provider sync
+重新打开 Codex
+
+我这边按这个流程处理后，历史对话恢复了。
+
+作者：小兵张健
+链接：https://juejin.cn/post/7630100585877028873
+来源：稀土掘金
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。
